@@ -12,6 +12,8 @@ import torchvision
 from torchvision import datasets, models
 import torchvision.transforms.v2 as tfs
 
+from torchmetrics import Accuracy
+
 from lightning import Trainer, LightningModule, LightningDataModule
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, RichProgressBar
 from lightning.pytorch import seed_everything
@@ -45,6 +47,7 @@ class WasteLitModel(LightningModule):
         self.lr_backbone = lr_backbone
         self.backbone_unfrozen = False  # чтобы не разморозить дважды
         self.unfreeze_epoch = unfreeze_epoch
+        self.task = task
 
         self.model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         #self.model = torch.compile(model)
@@ -57,6 +60,8 @@ class WasteLitModel(LightningModule):
           param.requires_grad = True
 
         self.loss = nn.CrossEntropyLoss()
+        self.accuracy_train = Accuracy(task='multiclass', num_classes=2)
+        self.accuracy_val = Accuracy(task='multiclass', num_classes=2)
         
     def forward(self, x):
         return self.model(x)
@@ -68,6 +73,12 @@ class WasteLitModel(LightningModule):
         acc = (preds.argmax(dim=1) == y).float().mean()
         self.log(f"{stage}_loss", loss, prog_bar=True)
         self.log(f"{stage}_acc", acc, prog_bar=True)
+        
+        if self.task is not None:
+            if stage == 'train':
+                self.accuracy_train.update(preds, y)
+            elif stage == 'val':
+                self.accuracy_val.update(preds, y)
         return loss
 
     def on_train_epoch_start(self):
@@ -75,6 +86,26 @@ class WasteLitModel(LightningModule):
           for param in self.model.parameters():
             param.requires_grad = True
           self.backbone_unfrozen = True
+          
+    def _acc_compute(self, stage):
+        if stage == 'train':
+            acc_fn = self.accuracy_train
+        elif stage == 'val':
+            acc_fn = self.accuracy_val
+        
+        self.task.get_logger().report_scalar(
+            title='Accuracy', 
+            series=stage, 
+            value=acc_fn.compute())
+        acc_fn.reset()
+    
+    def on_train_epoch_end(self):
+        if self.task is not None:
+            self._acc_compute('train')
+    
+    def on_validation_epoch_end(self):
+        if self.task is not None:
+            self._acc_compute('val')
     
     def training_step(self, batch, batch_idx):
         return self.basic_step(batch, batch_idx, 'train')
@@ -106,6 +137,8 @@ def check_clearml_env():
 
 def main(arg):
     cfg = CFG()
+    cfg.unfreeze_epoch = arg.unfreeze_epoch
+    cfg.lr_fc = arg.lr
     seed_everything(cfg.seed)
     
     task = None
@@ -147,7 +180,7 @@ def main(arg):
     )
     early_stop_cb = EarlyStopping(monitor='val_acc', mode='max', patience=3)
 
-    model = WasteLitModel(unfreeze_epoch=arg.unfreeze_epoch, lr_fc=arg.lr, lr_backbone=1e-4)
+    model = WasteLitModel(unfreeze_epoch=arg.unfreeze_epoch, lr_fc=arg.lr, lr_backbone=1e-4, task=task)
     
     try:
         if arg.fast_dev_run:
@@ -156,7 +189,23 @@ def main(arg):
             print("!!!Тестовый прогон завершился УСПЕШНО!!!")
             return
         
+        trainer = Trainer(
+        max_epochs=arg.epochs,
+        precision=16,
+        accelerator=cfg.device,
+        callbacks=[
+            checkpoint_cb,
+            early_stop_cb,
+            ]
+        )
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        trainer.test(model, test_loader)
         
+        # --- Загружаем лучшие веса ---
+        best_ckpt_path = checkpoint_cb.best_model_path
+        best_model = WasteLitModel.load_from_checkpoint(best_ckpt_path)
+        torch.save(best_model.model.state_dict(), cfg.models_dir+"waste_resnet18_best.pth")
+        print(f"Модель сохранена в {cfg.models_dir}/waste_resnet18_best.pth")
     except Exception as exp:
         print(f"!!!EXCEPTION: {exp}")
         print("!!!Прогон завершился с ошибкой!!!")
